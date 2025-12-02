@@ -169,14 +169,16 @@ list(APPEND transformer_engine_cuda_sources
 list(APPEND transformer_engine_cuda_arch_specific_sources
      gemm/cutlass_grouped_gemm.cu
      gemm/cutlass_device_grouped_gemm.cu
-     util/cast.cu
+     cast/cast.cu
      activation/gelu.cu
      activation/relu.cu
      activation/swiglu.cu
      transpose/quantize_transpose_square_blockwise.cu
      transpose/quantize_transpose_vector_blockwise_fp4.cu
      hadamard_transform/hadamard_transform.cu
-     hadamard_transform/hadamard_transform_cast_fusion.cu)
+     hadamard_transform/group_hadamard_transform.cu
+     hadamard_transform/hadamard_transform_cast_fusion.cu
+     hadamard_transform/group_hadamard_transform_cast_fusion.cu)
 
 # Compiling the files with the worst compilation time first to hopefully overlap
 # better with the faster-compiling cpp files
@@ -342,8 +344,7 @@ option(NVTE_BUILD_ACTIVATION_WITH_FAST_MATH "Compile activation kernels with --u
 if (NVTE_BUILD_ACTIVATION_WITH_FAST_MATH)
   list(APPEND nvte_sources_with_fast_math activation/gelu.cu
                                           activation/relu.cu
-                                          activation/swiglu.cu
-                                          util/cast.cu)
+                                          activation/swiglu.cu)
 endif()
 
 foreach(cuda_source IN LISTS nvte_sources_with_fast_math)
@@ -358,10 +359,10 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
 
 # Number of parallel build jobs
-if(ENV{MAX_JOBS})
-  set(BUILD_JOBS_STR "$ENV{MAX_JOBS}")
-elseif(ENV{NVTE_BUILD_MAX_JOBS})
-  set(BUILD_JOBS_STR "$ENV{NVTE_BUILD_MAX_JOBS}")
+if($ENV{MAX_JOBS})
+  set(BUILD_JOBS_STR $ENV{MAX_JOBS})
+elseif($ENV{NVTE_BUILD_MAX_JOBS})
+  set(BUILD_JOBS_STR $ENV{NVTE_BUILD_MAX_JOBS})
 else()
   set(BUILD_JOBS_STR "max")
 endif()

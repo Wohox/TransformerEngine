@@ -29,7 +29,6 @@
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/command_line.h"
-#include "cutlass/util/helper_cuda.hpp"
 #include "cutlass/util/print_error.hpp"
 
 // clang-format off
