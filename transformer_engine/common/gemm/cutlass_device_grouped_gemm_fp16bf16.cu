@@ -40,90 +40,55 @@ using namespace cute;
  * Fprop and Dgrad
  ******/
 
-template <typename Sm1xxBlkScaledConfig, typename UnderlyingProblemShape, typename ElementA,
-          typename ElementD, typename ElementSF, typename StrideA, typename StrideB,
-          typename StrideD, typename LayoutSFA, typename LayoutSFB, bool transB, bool IsNVFP4>
-__global__ void setGroupedGemmArguments(int num_experts, const int64_t *gemm_m_per_expert,
-                                        int gemm_n, int gemm_k, ElementA *ptr_A, ElementSF *ptr_SFA,
-                                        ElementD *ptr_D, UnderlyingProblemShape *problem_sizes,
-                                        ElementA **ptr_A_list, ElementSF **ptr_SFA_list,
-                                        StrideA *stride_A_list, LayoutSFA *layout_SFA_list,
-                                        StrideB *stride_B_list, LayoutSFB *layout_SFB_list,
-                                        ElementD **ptr_D_list, StrideD *stride_D_list,
-                                        float *alpha_array, float **alpha_ptr_list,
-                                        const float *amaxA,
-                                        const float *const *ptr_amaxB_list) {
-  constexpr float factor_inv = 1.0 / (6.0 * 6.0 * 448.0 * 448.0);
-  constexpr int SF_ALIGNMENT = IsNVFP4 ? 64 : 128;
+template <typename UnderlyingProblemShape, typename ElementA,
+          typename ElementD, typename StrideA, typename StrideB,
+          typename StrideD, bool transB>
+__global__ void setGroupedGemmArguments_fp16bf16(int num_experts, const int64_t *gemm_m_per_expert,
+                                        int gemm_n, int gemm_k, ElementA *ptr_A, ElementD *ptr_D,
+                                        UnderlyingProblemShape *problem_sizes,
+                                        ElementA **ptr_A_list, StrideA *stride_A_list, StrideB *stride_B_list,
+                                        ElementD **ptr_D_list, StrideD *stride_D_list) {
   int m_offset = 0;
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     for (int expert_id = 0; expert_id < num_experts; expert_id++) {
       int gemm_m = int(gemm_m_per_expert[expert_id]);
       problem_sizes[expert_id] = cute::make_shape(gemm_m, gemm_n, gemm_k);
-      // printf("expert_id: %d, gemm_m: %d, gemm_n: %d, gemm_k: %d\n", expert_id, gemm_m, gemm_n, gemm_k);
-      if (gemm_m == 0) {
-        problem_sizes[expert_id] = cute::make_shape(0, 0, 0);
-        if constexpr (IsNVFP4) {
-          alpha_ptr_list[expert_id] = alpha_array + expert_id;
-          *alpha_ptr_list[expert_id] = 0.0f;
-        }
-        continue;
-      }
 
-      ptr_A_list[expert_id] = IsNVFP4 ? ptr_A + m_offset * gemm_k / 2 : ptr_A + m_offset * gemm_k;
-      ptr_SFA_list[expert_id] = ptr_SFA + m_offset * (gemm_k / SF_ALIGNMENT * 4);
+      ptr_A_list[expert_id] = ptr_A + m_offset * gemm_k;
       stride_A_list[expert_id] = cute::make_stride(int64_t(gemm_k), _1{}, _0{});
-      layout_SFA_list[expert_id] =
-          Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(gemm_m, gemm_n, gemm_k, 1));
 
-      if constexpr (transB || IsNVFP4) {
+      if constexpr (transB) {
         stride_B_list[expert_id] = cute::make_stride(int64_t(gemm_k), _1{}, _0{});
       } else {
         stride_B_list[expert_id] = cute::make_stride(_1{}, int64_t(gemm_n), _0{});
       }
-      layout_SFB_list[expert_id] =
-          Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(gemm_m, gemm_n, gemm_k, 1));
 
       ptr_D_list[expert_id] = ptr_D + m_offset * gemm_n;
       stride_D_list[expert_id] = cute::make_stride(int64_t(gemm_n), _1{}, _0{});
 
-      if constexpr (IsNVFP4) {
-        alpha_ptr_list[expert_id] = alpha_array + expert_id;
-        *alpha_ptr_list[expert_id] = amaxA[expert_id] * (*ptr_amaxB_list[expert_id]) * factor_inv;
-        // printf("alpha_out (expert %d) = amaxA[%d] * amaxB[%d] * factor_inv = %.16f * %.16f * %.16f = %.16f\n", expert_id, expert_id, expert_id, amaxA[expert_id], (*ptr_amaxB_list[expert_id]), factor_inv, *alpha_ptr_list[expert_id]);
-      }
       m_offset += gemm_m;
     }
   }
 }
 
-template <typename ElementInput, typename ElementSF, typename ElementC, bool DGrad, bool TransB>
-void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const float *amaxA,
-                                     const void **ptr_B_list, const void **ptr_SFB_list,
-                                     const float *const *ptr_amaxB_list, ElementC *D,
+template <typename ElementInput, typename ElementC, bool DGrad, bool TransB>
+void generic_moe_gemm_kernelLauncher_fp16bf16(ElementInput *A, const void **ptr_B_list, ElementC *D,
                                      const int64_t *gemm_m_per_expert, int gemm_n, int gemm_k,
                                      int num_experts, size_t workspaceSize, void *workspace,
                                      cudaStream_t stream, int *kernel_occupancy = nullptr) {
-  constexpr bool IsNVFP4 = cute::is_same_v<ElementInput, cutlass::float_e2m1_t>;
-  static_assert(cute::is_same_v<ElementInput, cutlass::float_e4m3_t> || cute::is_same_v<ElementInput, cutlass::float_e5m2_t> || cute::is_same_v<ElementInput, cutlass::float_e2m1_t>, "Unsupported input type. Expected e4m3 or e5m2 or e2m1.");
-  static_assert((cute::is_same_v<ElementSF, cutlass::float_ue8m0_t> && !IsNVFP4) || (cute::is_same_v<ElementSF, cutlass::float_ue4m3_t> && IsNVFP4), "Unsupported SF type. Expected ue8m0(mxfp8) or ue4m3(nvfp4).");
-
-  static_assert(cute::is_same_v<ElementC, cutlass::bfloat16_t> ||
-                    cute::is_same_v<ElementC, cutlass::half_t> || cute::is_same_v<ElementC, float>,
-                "Unsupported output type. Expected bf16/fp16/fp32.");
+  static_assert(cute::is_same_v<ElementInput, cutlass::half_t> || cute::is_same_v<ElementInput, cutlass::bfloat16_t>, "Unsupported input type. Expected fp16 or bf16.");
+  static_assert(cute::is_same_v<ElementC, cutlass::bfloat16_t> || cute::is_same_v<ElementC, cutlass::half_t> || cute::is_same_v<ElementC, float>, "Unsupported output type. Expected bf16/fp16/fp32.");
 
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
 
-  using ElementA = conditional_t<IsNVFP4, cutlass::nv_float4_t<ElementInput>, cutlass::mx_float8_t<ElementInput>>;  // Element type for A matrix operand
+  using ElementA = ElementInput;  // Element type for A matrix operand
   using LayoutA = cutlass::layout::RowMajor;            // Layout type for A matrix operand
-  constexpr int AlignmentA = 32;  // Alignment of A matrix in units of elements (up to 16 bytes)
+  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // Alignment of A matrix in units of elements (up to 16 bytes)
 
   // B matrix configuration
-  using ElementB = conditional_t<IsNVFP4, cutlass::nv_float4_t<ElementInput>, cutlass::mx_float8_t<ElementInput>>;  // Element type for B matrix operand
-  using LayoutB =
-      cute::conditional_t<TransB || IsNVFP4, cutlass::layout::ColumnMajor,
-                          cutlass::layout::RowMajor>;  // Layout type for B matrix operand
-  constexpr int AlignmentB = 32;  // Alignment of A matrix in units of elements (up to 16 bytes)
+  using ElementB = ElementInput;  // Element type for B matrix operand
+  using LayoutB = cute::conditional_t<TransB, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;  // Layout type for B matrix operand
+  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value; // Alignment of A matrix in units of elements (up to 16 bytes)
 
   // C/D matrix configuration
   using ElementD = ElementC;
@@ -134,26 +99,22 @@ void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const floa
 
   // Core kernel configurations
   using ArchTag = cutlass::arch::Sm100;
-  using EpilogueOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
-  using MainloopOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using EpilogueOperatorClass = cutlass::arch::OpClassTensorOp;
+  using MainloopOperatorClass = cutlass::arch::OpClassTensorOp;
   using StageCountType = cutlass::gemm::collective::StageCountAuto;
 
   // Runtime Cluster Shape
   using ClusterShape = Shape<int32_t, int32_t, _1>;
 
   struct MMA2SMConfig {
-    using MmaTileShape =
-        cute::conditional_t<IsNVFP4, Shape<_256, _256, _256>, Shape<_256, _256, _128>>;
-    using KernelSchedule = conditional_t<IsNVFP4,
-        cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmNvf4Sm100,
-        cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100>;  // Kernel to launch
-    using EpilogueSchedule =
-        cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;  // Epilogue to launch
+    using MmaTileShape = Shape<_256, _256, Int<128 / sizeof(ElementA)>>;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;  // Kernel to launch
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;  // Epilogue to launch
   };
 
   using CollectiveEpilogue2SM = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, EpilogueOperatorClass, typename MMA2SMConfig::MmaTileShape, ClusterShape,
-      Shape<_128,_64>, ElementAccumulator, ElementAccumulator, void,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator, void,
       LayoutC *, AlignmentC, ElementD, LayoutC *, AlignmentD,
       typename MMA2SMConfig::EpilogueSchedule>::CollectiveOp;
   using CollectiveMainloop2SM = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -171,11 +132,6 @@ void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const floa
   using StrideC = typename GemmGrouped::GemmKernel::InternalStrideC;
   using StrideD = typename GemmGrouped::GemmKernel::InternalStrideD;
 
-  using LayoutSFA = typename GemmGrouped::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
-  using LayoutSFB = typename GemmGrouped::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
-  using Sm1xxBlkScaledConfig =
-      typename GemmGrouped::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
-
   using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
 
   auto get_aligned_offset = [](size_t current_offset, size_t alignment) -> size_t {
@@ -186,7 +142,7 @@ void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const floa
     throw std::runtime_error("TE CUTLASS device grouped gemm workspace is null");
   }
 
-  size_t offset = get_aligned_offset(num_experts * 3 * sizeof(uint64_t), 128); // inputA_and_SF_addrs + amax_addrs
+  size_t offset = get_aligned_offset(num_experts * 3 * sizeof(uint64_t), 128); // inputB_addrs and dummy data pointers
   auto ptr_A = reinterpret_cast<typename GemmGrouped::ElementA *>(A);
   auto ptr_A_list = reinterpret_cast<typename GemmGrouped::ElementA **>(
       reinterpret_cast<char *>(workspace) + offset);
@@ -197,12 +153,6 @@ void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const floa
       reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementD *), 128);
 
-  auto ptr_SFA = reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFA);
-  auto ptr_SFA_list = reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(
-      reinterpret_cast<char *>(workspace) + offset);
-  offset = get_aligned_offset(
-      offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), 128);
-
   auto stride_A_list = reinterpret_cast<StrideA *>(reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(StrideA), 128);
   auto stride_B_list = reinterpret_cast<StrideB *>(reinterpret_cast<char *>(workspace) + offset);
@@ -210,49 +160,25 @@ void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const floa
   auto stride_D_list = reinterpret_cast<StrideD *>(reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(StrideD), 128);
 
-  auto layout_SFA_list =
-      reinterpret_cast<LayoutSFA *>(reinterpret_cast<char *>(workspace) + offset);
-  offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFA), 128);
-  auto layout_SFB_list =
-      reinterpret_cast<LayoutSFB *>(reinterpret_cast<char *>(workspace) + offset);
-  offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFB), 128);
-
   auto problem_sizes = reinterpret_cast<ProblemShape::UnderlyingProblemShape *>(
       reinterpret_cast<char *>(workspace) + offset);
   offset =
       get_aligned_offset(offset + num_experts * sizeof(ProblemShape::UnderlyingProblemShape), 128);
 
-
-  float *alpha_array = nullptr;
-  float **alpha_ptr_list = nullptr;
-  if constexpr (IsNVFP4) {
-    alpha_array = reinterpret_cast<float *>(reinterpret_cast<char *>(workspace) + offset);
-    offset = get_aligned_offset(offset + num_experts * sizeof(float), size_t(128));
-    alpha_ptr_list = reinterpret_cast<float **>(reinterpret_cast<char *>(workspace) + offset);
-    offset = get_aligned_offset(offset + num_experts * sizeof(float *), size_t(128));
-  }
-
-  setGroupedGemmArguments<Sm1xxBlkScaledConfig, ProblemShape::UnderlyingProblemShape,
+  setGroupedGemmArguments_fp16bf16<ProblemShape::UnderlyingProblemShape,
                           typename GemmGrouped::ElementA, typename GemmGrouped::ElementD,
-                          typename GemmGrouped::GemmKernel::ElementSF, StrideA, StrideB, StrideD,
-                          LayoutSFA, LayoutSFB, TransB, IsNVFP4><<<1, 32, 0, stream>>>(
-      num_experts, gemm_m_per_expert, gemm_n, gemm_k, ptr_A, ptr_SFA, ptr_D, problem_sizes,
-      ptr_A_list, ptr_SFA_list, stride_A_list, layout_SFA_list, stride_B_list, layout_SFB_list,
-      ptr_D_list, stride_D_list, alpha_array, alpha_ptr_list, amaxA, ptr_amaxB_list);
+                          StrideA, StrideB, StrideD, TransB><<<1, 32, 0, stream>>>(
+      num_experts, gemm_m_per_expert, gemm_n, gemm_k, ptr_A, ptr_D, problem_sizes,
+      ptr_A_list, stride_A_list, stride_B_list,
+      ptr_D_list, stride_D_list);
 
   typename GemmGrouped::Arguments args;
   decltype(args.epilogue.thread) fusion_args;
   fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr = nullptr;
-  if constexpr (IsNVFP4) {
-    fusion_args.alpha = 0;
-    fusion_args.alpha_ptr_array = alpha_ptr_list;
-    fusion_args.dAlpha = {_0{}, _0{}, 1};
-  } else {
-    fusion_args.alpha = 1;
-    fusion_args.alpha_ptr_array = nullptr;
-    fusion_args.dAlpha = {_0{}, _0{}, 0};
-  }
+  fusion_args.alpha = 1;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.dAlpha = {_0{}, _0{}, 0};
   fusion_args.beta = 0;
   fusion_args.beta_ptr_array = nullptr;
   fusion_args.dBeta = {_0{}, _0{}, 0};
@@ -276,11 +202,7 @@ void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const floa
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {num_experts, problem_sizes, nullptr},
       {const_cast<const typename GemmGrouped::ElementA **>(ptr_A_list), stride_A_list,
-       reinterpret_cast<const typename GemmGrouped::ElementB **>(ptr_B_list), stride_B_list,
-       const_cast<const typename GemmGrouped::GemmKernel::ElementSF **>(ptr_SFA_list),
-       layout_SFA_list,
-       reinterpret_cast<const typename GemmGrouped::GemmKernel::ElementSF **>(ptr_SFB_list),
-       layout_SFB_list},
+       reinterpret_cast<const typename GemmGrouped::ElementB **>(ptr_B_list), stride_B_list},
       {fusion_args, nullptr, stride_D_list, ptr_D_list, stride_D_list},
       hw_info,
       scheduler};
@@ -317,32 +239,23 @@ void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const floa
   }
 }
 
-// Only mxfp8 is supported for now
 // A is splited tensor list, B is single Tensor, D is single Tensor
-void nvte_device_cutlass_grouped_gemm(const void **A_and_SF_addrs, const NVTETensor *B,
+void nvte_device_cutlass_grouped_gemm_fp16bf16(const void **A_addrs, const NVTETensor *B,
                                       NVTETensor *D, const int64_t *m_splits, const int gemm_m,
                                       const NVTETensor *bias, NVTETensor *pre_gelu_out,
                                       const int num_gemms, bool transa, bool transb, bool grad,
                                       NVTETensor *workspace, size_t workspaceSize,
                                       bool use_split_accumulator, int math_sm_count,
                                       cudaStream_t stream) {
-  NVTE_API_CALL(nvte_device_cutlass_grouped_gemm);
+  NVTE_API_CALL(nvte_device_cutlass_grouped_gemm_fp16bf16);
   using namespace transformer_engine;
 
   // Process B
   const transformer_engine::Tensor *inputB = convertNVTETensor(B[0]);
-  if (transb) {
-    NVTE_CHECK(inputB->has_columnwise_data(), "Input B is missing column-wise usage");
-  } else {
-    NVTE_CHECK(inputB->has_data(), "Input B is missing row-wise usage");
-  }
-  void *raw_inputB_ptr = transb ? inputB->columnwise_data.dptr : inputB->data.dptr;
-  void *raw_inputB_SF_ptr = transb ? inputB->columnwise_scale_inv.dptr : inputB->scale_inv.dptr;
-  void *raw_inputB_amax_ptr_list = transb ? inputB->columnwise_amax.dptr : inputB->amax.dptr;
+  void *raw_inputB_ptr = inputB->data.dptr;
 
   // Process D
   const transformer_engine::Tensor *outputD = convertNVTETensor(D[0]);
-  NVTE_CHECK(outputD->has_data(), "Input D is missing row-wise usage");
   void *raw_outputD_ptr = outputD->data.dptr;
 
   // Get GEMM shape
@@ -354,7 +267,7 @@ void nvte_device_cutlass_grouped_gemm(const void **A_and_SF_addrs, const NVTETen
 
   // Dispatch
   using transformer_engine::DType;
-  const DType ab_dtype = transb ? inputB->columnwise_data.dtype : inputB->data.dtype;
+  const DType ab_dtype = inputB->data.dtype;
   const DType d_dtype = outputD->data.dtype;
 
   auto workspace_ptr = convertNVTETensor(workspace[0])->data.dptr;
@@ -362,39 +275,30 @@ void nvte_device_cutlass_grouped_gemm(const void **A_and_SF_addrs, const NVTETen
   auto dispatch_layout = [&](auto ab_dtype, auto d_dtype) {
     // dispatch based on input layout and dgrad flag
     using ABType = decltype(ab_dtype);
-    constexpr bool IsNVFP4_AB = cute::is_same_v<ABType, cutlass::float_e2m1_t>;
-    using ABSFType = conditional_t<IsNVFP4_AB, cutlass::float_ue4m3_t, cutlass::float_ue8m0_t>;
     using DType = decltype(d_dtype);
 
     ABType *inputB_ptr = reinterpret_cast<ABType *>(raw_inputB_ptr);
-    ABSFType *inputB_SF_ptr = reinterpret_cast<ABSFType *>(raw_inputB_SF_ptr);
-    const float *inputB_amax_ptr =
-        IsNVFP4_AB ? reinterpret_cast<const float *>(raw_inputB_amax_ptr_list) : nullptr;
-    const float *const *inputA_amax_ptr_list =
-        IsNVFP4_AB
-            ? reinterpret_cast<const float *const *>(A_and_SF_addrs + 2 * num_gemms)
-            : nullptr;
     DType *outputD_ptr = reinterpret_cast<DType *>(raw_outputD_ptr);
 
     // Swap A and B
     if (transa) {
       if (grad) {
-        generic_moe_gemm_kernelLauncher<ABType, ABSFType, DType, true, true>(
-            inputB_ptr, inputB_SF_ptr, inputB_amax_ptr, A_and_SF_addrs, A_and_SF_addrs + num_gemms, inputA_amax_ptr_list, outputD_ptr,
+        generic_moe_gemm_kernelLauncher_fp16bf16<ABType, DType, true, true>(
+            inputB_ptr, A_addrs, outputD_ptr,
             m_splits, gemm_m, gemm_k, num_gemms, workspaceSize, workspace_ptr, stream);
       } else {
-        generic_moe_gemm_kernelLauncher<ABType, ABSFType, DType, false, true>(
-            inputB_ptr, inputB_SF_ptr, inputB_amax_ptr, A_and_SF_addrs, A_and_SF_addrs + num_gemms, inputA_amax_ptr_list, outputD_ptr,
+        generic_moe_gemm_kernelLauncher_fp16bf16<ABType, DType, false, true>(
+            inputB_ptr, A_addrs, outputD_ptr,
             m_splits, gemm_m, gemm_k, num_gemms, workspaceSize, workspace_ptr, stream);
       }
     } else {
       if (grad) {
-        generic_moe_gemm_kernelLauncher<ABType, ABSFType, DType, true, false>(
-            inputB_ptr, inputB_SF_ptr, inputB_amax_ptr, A_and_SF_addrs, A_and_SF_addrs + num_gemms, inputA_amax_ptr_list, outputD_ptr,
+        generic_moe_gemm_kernelLauncher_fp16bf16<ABType, DType, true, false>(
+            inputB_ptr, A_addrs, outputD_ptr,
             m_splits, gemm_m, gemm_k, num_gemms, workspaceSize, workspace_ptr, stream);
       } else {
-        generic_moe_gemm_kernelLauncher<ABType, ABSFType, DType, false, false>(
-            inputB_ptr, inputB_SF_ptr, inputB_amax_ptr, A_and_SF_addrs, A_and_SF_addrs + num_gemms, inputA_amax_ptr_list, outputD_ptr,
+        generic_moe_gemm_kernelLauncher_fp16bf16<ABType, DType, false, false>(
+            inputB_ptr, A_addrs, outputD_ptr,
             m_splits, gemm_m, gemm_k, num_gemms, workspaceSize, workspace_ptr, stream);
       }
     }
@@ -420,17 +324,14 @@ void nvte_device_cutlass_grouped_gemm(const void **A_and_SF_addrs, const NVTETen
   auto dispatch = [&]() {
     // dispatch based on A/B dtype
     switch (ab_dtype) {
-      case DType::kFloat8E4M3:
-        dispatch_output_dtype(cutlass::float_e4m3_t{});
+      case DType::kFloat16:
+        dispatch_output_dtype(cutlass::half_t{});
         break;
-      case DType::kFloat8E5M2:
-        dispatch_output_dtype(cutlass::float_e5m2_t{});
-        break;
-      case DType::kFloat4E2M1:
-        dispatch_output_dtype(cutlass::float_e2m1_t{});
+      case DType::kBFloat16:
+        dispatch_output_dtype(cutlass::bfloat16_t{});
         break;
       default:
-        throw std::runtime_error("Unsupported input dtype. A/B must be FP8 e4m3, e5m2, or e2m1.");
+        throw std::runtime_error("Unsupported input dtype. A/B must be FP16 or BF16.");
     }
   };
 
@@ -498,22 +399,17 @@ struct WgradAccumulatePolicy {
   }
 };
 
-template <typename Sm1xxBlkScaledConfig, typename UnderlyingProblemShape, typename ElementA,
+template <typename UnderlyingProblemShape, typename ElementA,
           typename ElementB, typename ElementC, typename ElementD, typename ElementAccumulator,
-          typename ElementSF, typename StrideA, typename StrideB, typename StrideD,
-          typename LayoutSFA, typename LayoutSFB, bool transD, bool IsNVFP4>
-__global__ void setGroupedGemmWgradArguments(
+          typename StrideA, typename StrideB, typename StrideD, bool transD>
+__global__ void setGroupedGemmWgradArguments_fp16bf16(
     int num_experts, int gemm_m, int gemm_n, const int64_t *gemm_k_per_expert, int total_gemm_k,
-    ElementA *ptr_A, ElementSF *ptr_SFA, ElementB *ptr_B, ElementSF *ptr_SFB,
-    UnderlyingProblemShape *problem_sizes, ElementA **ptr_A_list, ElementSF **ptr_SFA_list,
-    StrideA *stride_A_list, LayoutSFA *layout_SFA_list, ElementB **ptr_B_list,
-    ElementSF **ptr_SFB_list, StrideB *stride_B_list, LayoutSFB *layout_SFB_list,
+    ElementA *ptr_A, ElementB *ptr_B,
+    UnderlyingProblemShape *problem_sizes, ElementA **ptr_A_list, StrideA *stride_A_list, ElementB **ptr_B_list,
+    StrideB *stride_B_list,
     ElementD **ptr_D_list, StrideD *stride_D_list, ElementC **ptr_C_list,
     ElementAccumulator **beta_ptr_list, ElementAccumulator *beta_zero, ElementAccumulator *beta_one,
-    WgradAccumulatePolicy accumulate_policy, float *alpha_array,
-    float **alpha_ptr_list, const float *amaxA, const float *amaxB) {
-  constexpr float factor_inv = 1.0 / (6.0 * 6.0 * 448.0 * 448.0);
-  constexpr int SF_ALIGNMENT = IsNVFP4 ? 64 : 128;
+    WgradAccumulatePolicy accumulate_policy) {
   int k_offset = 0;
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     *beta_zero = 0;
@@ -534,45 +430,13 @@ __global__ void setGroupedGemmWgradArguments(
       if (gemm_k == 0) {
         // If gemm_k is 0, we need to set the problem_sizes to 0, 0, 0 to skip the gemm
         problem_sizes[expert_id] = cute::make_shape(0, 0, 0);
-        if constexpr (IsNVFP4) {
-          alpha_ptr_list[expert_id] = alpha_array + expert_id;
-          *alpha_ptr_list[expert_id] = 0.0f;
-        }
         continue;
       }
 
-      if constexpr (IsNVFP4) { // NVFP4 only support K-Major A/B
-        ptr_A_list[expert_id] = ptr_A + k_offset / 2;
-        ptr_B_list[expert_id] = ptr_B + k_offset / 2;
-        stride_A_list[expert_id] = cute::make_stride(int64_t(total_gemm_k), _1{}, _0{});
-        stride_B_list[expert_id] = cute::make_stride(int64_t(total_gemm_k), _1{}, _0{});
-        alpha_ptr_list[expert_id] = alpha_array + expert_id;
-        *alpha_ptr_list[expert_id] = amaxA[expert_id] * amaxB[expert_id] * factor_inv;
-        // printf("alpha_out (expert %d) = amaxA[%d] * amaxB[%d] * factor_inv = %.16f * %.16f * %.16f = %.16f\n", expert_id, expert_id, expert_id, amaxA[expert_id], amaxB[expert_id], factor_inv, *alpha_ptr_list[expert_id]);
-      } else {
-        ptr_A_list[expert_id] = ptr_A + gemm_m * k_offset;
-        ptr_B_list[expert_id] = ptr_B + gemm_n * k_offset;
-        stride_A_list[expert_id] = cute::make_stride(_1{}, int64_t(gemm_m), _0{});
-        stride_B_list[expert_id] = cute::make_stride(_1{}, int64_t(gemm_n), _0{});
-      }
-
-      ptr_SFA_list[expert_id] = ptr_SFA + 128 * (k_offset / SF_ALIGNMENT * 4);
-      auto temp_sfa_layout = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
-          cute::make_shape(gemm_m, gemm_n, total_gemm_k, 1));
-      layout_SFA_list[expert_id] = cute::make_layout(
-          get<0>(temp_sfa_layout),
-          make_layout(get<0>(get<1>(temp_sfa_layout)),
-                      make_layout(gemm_k / SF_ALIGNMENT, get<1>(get<1>(temp_sfa_layout.stride())))),
-          get<2>(temp_sfa_layout));
-
-      ptr_SFB_list[expert_id] = ptr_SFB + 128 * (k_offset / SF_ALIGNMENT * 4);
-      auto temp_sfb_layout = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-          cute::make_shape(gemm_m, gemm_n, total_gemm_k, 1));
-      layout_SFB_list[expert_id] = cute::make_layout(
-          get<0>(temp_sfb_layout),
-          make_layout(get<0>(get<1>(temp_sfb_layout)),
-                      make_layout(gemm_k / SF_ALIGNMENT, get<1>(get<1>(temp_sfb_layout.stride())))),
-          get<2>(temp_sfb_layout));
+      ptr_A_list[expert_id] = ptr_A + gemm_m * k_offset;
+      ptr_B_list[expert_id] = ptr_B + gemm_n * k_offset;
+      stride_A_list[expert_id] = cute::make_stride(_1{}, int64_t(gemm_m), _0{});
+      stride_B_list[expert_id] = cute::make_stride(_1{}, int64_t(gemm_n), _0{});
 
       if constexpr (transD) {
         stride_D_list[expert_id] = cute::make_stride(_1{}, int64_t(gemm_m), _0{});
@@ -629,40 +493,29 @@ __global__ void setGroupedGemmWgradArguments(
   }
 }
 
-template <typename ElementInput, typename ElementSF, typename ElementC, bool TransD>
-void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, const float *amaxA, 
-                                           ElementInput *B, ElementSF *SFB, const float *amaxB,
+template <typename ElementInput, typename ElementC, bool TransD>
+void generic_moe_gemm_wgrad_kernelLauncher_fp16bf16(ElementInput *A, ElementInput *B,
                                            void **ptr_D_list, int gemm_m, int gemm_n, const int64_t *gemm_k_per_expert,
                                            int total_gemm_k, int num_experts, bool accumulate,
                                            bool *accumulate_mask, size_t workspaceSize,
                                            void *workspace, cudaStream_t stream,
                                            int *kernel_occupancy = nullptr) {
-  constexpr bool IsNVFP4 = cute::is_same_v<ElementInput, cutlass::float_e2m1_t>;
-  static_assert(cute::is_same_v<ElementInput, cutlass::float_e4m3_t> ||
-                    cute::is_same_v<ElementInput, cutlass::float_e5m2_t> ||
-                    cute::is_same_v<ElementInput, cutlass::float_e2m1_t>,
-                "Unsupported input type. Expected e4m3, e5m2 or e2m1.");
-  static_assert((cute::is_same_v<ElementSF, cutlass::float_ue8m0_t> && !IsNVFP4) ||
-                    (cute::is_same_v<ElementSF, cutlass::float_ue4m3_t> && IsNVFP4),
-                "Unsupported SF type. Expected ue8m0 (mxfp8) or ue4m3 (nvfp4).");
+  static_assert(cute::is_same_v<ElementInput, cutlass::half_t> || cute::is_same_v<ElementInput, cutlass::bfloat16_t>,
+                "Unsupported input type. Expected fp16 or bf16.");
   static_assert(cute::is_same_v<ElementC, cutlass::bfloat16_t> ||
                     cute::is_same_v<ElementC, cutlass::half_t> || cute::is_same_v<ElementC, float>,
                 "Unsupported output type. Expected bf16/fp16/fp32.");
 
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
 
-  using ElementA =
-      conditional_t<IsNVFP4, cutlass::nv_float4_t<ElementInput>,
-                    cutlass::mx_float8_t<ElementInput>>;  // Element type for A matrix operand
-  using LayoutA = conditional_t<IsNVFP4, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>;         // Layout type for A matrix operand
-  constexpr int AlignmentA = 32;  // Alignment of A matrix in units of elements (up to 16 bytes)
+  using ElementA = ElementInput;  // Element type for A matrix operand
+  using LayoutA = cutlass::layout::ColumnMajor;            // Layout type for A matrix operand
+  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // Alignment of A matrix in units of elements (up to 16 bytes)
 
   // B matrix configuration
-  using ElementB =
-      conditional_t<IsNVFP4, cutlass::nv_float4_t<ElementInput>,
-                    cutlass::mx_float8_t<ElementInput>>;  // Element type for B matrix operand
-  using LayoutB = conditional_t<IsNVFP4, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;            // Layout type for B matrix operand
-  constexpr int AlignmentB = 32;  // Alignment of A matrix in units of elements (up to 16 bytes)
+  using ElementB = ElementInput;  // Element type for B matrix operand
+  using LayoutB = cutlass::layout::RowMajor;            // Layout type for B matrix operand
+  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // Alignment of A matrix in units of elements (up to 16 bytes)
 
   // C/D matrix configuration
   using ElementD = ElementC;
@@ -674,21 +527,17 @@ void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, cons
 
   // Core kernel configurations
   using ArchTag = cutlass::arch::Sm100;
-  using EpilogueOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
-  using MainloopOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using EpilogueOperatorClass = cutlass::arch::OpClassTensorOp;
+  using MainloopOperatorClass = cutlass::arch::OpClassTensorOp;
   using StageCountType = cutlass::gemm::collective::StageCountAuto;
 
   // Runtime Cluster Shape
   using ClusterShape = Shape<int32_t, int32_t, _1>;
 
   struct MMA2SMConfig {
-    using MmaTileShape =
-        cute::conditional_t<IsNVFP4, Shape<_256, _128, _256>, Shape<_256, _128, _128>>;
-    using KernelSchedule = conditional_t<IsNVFP4,
-                                         cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmNvf4Sm100,
-                                         cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100>;  // Kernel to launch
-    using EpilogueSchedule =
-        cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;  // Epilogue to launch
+    using MmaTileShape = Shape<_256, _256, Int<128 / sizeof(ElementA)>>;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;  // Kernel to launch
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;  // Epilogue to launch
   };
 
   using CollectiveEpilogue2SM = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -710,11 +559,6 @@ void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, cons
   using StrideB = typename GemmGrouped::GemmKernel::InternalStrideB;
   using StrideC = typename GemmGrouped::GemmKernel::InternalStrideC;
   using StrideD = typename GemmGrouped::GemmKernel::InternalStrideD;
-
-  using LayoutSFA = typename GemmGrouped::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
-  using LayoutSFB = typename GemmGrouped::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
-  using Sm1xxBlkScaledConfig =
-      typename GemmGrouped::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
   using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
 
@@ -745,18 +589,6 @@ void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, cons
   offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementC *),
                               size_t(128));
 
-  auto ptr_SFA = reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFA);
-  auto ptr_SFA_list = reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(
-      reinterpret_cast<char *>(workspace) + offset);
-  offset = get_aligned_offset(
-      offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), size_t(128));
-
-  auto ptr_SFB = reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFB);
-  auto ptr_SFB_list = reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(
-      reinterpret_cast<char *>(workspace) + offset);
-  offset = get_aligned_offset(
-      offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), size_t(128));
-
   auto stride_A_list = reinterpret_cast<StrideA *>(reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(StrideA), size_t(128));
   auto stride_B_list = reinterpret_cast<StrideB *>(reinterpret_cast<char *>(workspace) + offset);
@@ -764,27 +596,10 @@ void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, cons
   auto stride_D_list = reinterpret_cast<StrideD *>(reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(StrideD), size_t(128));
 
-  auto layout_SFA_list =
-      reinterpret_cast<LayoutSFA *>(reinterpret_cast<char *>(workspace) + offset);
-  offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFA), size_t(128));
-  auto layout_SFB_list =
-      reinterpret_cast<LayoutSFB *>(reinterpret_cast<char *>(workspace) + offset);
-  offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFB), size_t(128));
-
   auto problem_sizes = reinterpret_cast<ProblemShape::UnderlyingProblemShape *>(
       reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(ProblemShape::UnderlyingProblemShape),
                               size_t(128));
-
-  float *alpha_array = nullptr;
-  float **alpha_ptr_list = nullptr;
-  if constexpr (IsNVFP4) {
-    alpha_array = reinterpret_cast<float *>(reinterpret_cast<char *>(workspace) + offset);
-    offset = get_aligned_offset(offset + num_experts * sizeof(float), size_t(128));
-    alpha_ptr_list = reinterpret_cast<float **>(reinterpret_cast<char *>(workspace) + offset);
-    offset = get_aligned_offset(offset + num_experts * sizeof(float *), size_t(128));
-  }
-
   auto beta_ptr_list =
       reinterpret_cast<ElementAccumulator **>(reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(ElementAccumulator *), size_t(128));
@@ -810,18 +625,15 @@ void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, cons
   const int work_units = (total_elems + elems_per_vec - 1) / elems_per_vec;
   const int threads_per_block = 256;
   const int blocks = (work_units + threads_per_block - 1) / threads_per_block;
-  setGroupedGemmWgradArguments<Sm1xxBlkScaledConfig, ProblemShape::UnderlyingProblemShape,
+  setGroupedGemmWgradArguments_fp16bf16<ProblemShape::UnderlyingProblemShape,
                                typename GemmGrouped::ElementA, typename GemmGrouped::ElementB,
                                typename GemmGrouped::ElementC, typename GemmGrouped::ElementD,
-                               ElementAccumulator, typename GemmGrouped::GemmKernel::ElementSF,
-                               StrideA, StrideB, StrideD, LayoutSFA, LayoutSFB, TransD, IsNVFP4>
+                               ElementAccumulator, StrideA, StrideB, StrideD, TransD>
       <<<blocks, threads_per_block, 0, stream>>>(
-          num_experts, gemm_m, gemm_n, gemm_k_per_expert, total_gemm_k, ptr_A, ptr_SFA, ptr_B,
-          ptr_SFB, problem_sizes, ptr_A_list, ptr_SFA_list, stride_A_list, layout_SFA_list,
-          ptr_B_list, ptr_SFB_list, stride_B_list, layout_SFB_list,
+          num_experts, gemm_m, gemm_n, gemm_k_per_expert, total_gemm_k, ptr_A, ptr_B,
+          problem_sizes, ptr_A_list, stride_A_list, ptr_B_list, stride_B_list,
           reinterpret_cast<typename GemmGrouped::ElementD **>(ptr_D_list), stride_D_list,
-          ptr_C_list, beta_ptr_list, beta_zero, beta_one, accumulate_policy, alpha_array,
-          alpha_ptr_list, amaxA, amaxB);
+          ptr_C_list, beta_ptr_list, beta_zero, beta_one, accumulate_policy);
 
   // Check for CUDA errors after kernel launch
   cudaError_t cuda_error = cudaGetLastError();
@@ -836,15 +648,9 @@ void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, cons
   fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr = nullptr;
   // Set alpha and beta
-  if constexpr (IsNVFP4) {
-    fusion_args.alpha = 0;
-    fusion_args.alpha_ptr_array = alpha_ptr_list;
-    fusion_args.dAlpha = {_0{}, _0{}, 1};
-  } else {
-    fusion_args.alpha = 1;
-    fusion_args.alpha_ptr_array = nullptr;
-    fusion_args.dAlpha = {_0{}, _0{}, 0};
-  }
+  fusion_args.alpha = 1;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.dAlpha = {_0{}, _0{}, 0};
   fusion_args.beta = 0;
   fusion_args.beta_ptr_array = beta_ptr_list;
   fusion_args.dBeta = {_0{}, _0{}, 1};
@@ -868,11 +674,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, cons
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {num_experts, problem_sizes, nullptr},
       {const_cast<const typename GemmGrouped::ElementA **>(ptr_A_list), stride_A_list,
-       const_cast<const typename GemmGrouped::ElementB **>(ptr_B_list), stride_B_list,
-       const_cast<const typename GemmGrouped::GemmKernel::ElementSF **>(ptr_SFA_list),
-       layout_SFA_list,
-       const_cast<const typename GemmGrouped::GemmKernel::ElementSF **>(ptr_SFB_list),
-       layout_SFB_list},
+       const_cast<const typename GemmGrouped::ElementB **>(ptr_B_list), stride_B_list},
       {fusion_args, const_cast<const typename GemmGrouped::ElementC **>(ptr_C_list), stride_D_list,
        reinterpret_cast<typename GemmGrouped::ElementD **>(ptr_D_list), stride_D_list},
       hw_info,
@@ -910,40 +712,25 @@ void generic_moe_gemm_wgrad_kernelLauncher(ElementInput *A, ElementSF *SFA, cons
   }
 }
 
-// Only mxfp8 is supported for now
 // A and B is single Tensor, D is splited tensor list
-void nvte_device_cutlass_grouped_gemm_wgrad(
+void nvte_device_cutlass_grouped_gemm_wgrad_fp16bf16(
     const NVTETensor *A, const NVTETensor *B, void **outputD_ptr_list,
     transformer_engine::DType D_type, const int64_t *m_splits, const NVTETensor *bias,
     NVTETensor *pre_gelu_out, const int num_gemms, bool transa, bool transb, NVTETensor *workspace,
     size_t workspaceSize, bool accumulate, bool *accumulate_mask, bool use_split_accumulator,
     int math_sm_count, cudaStream_t stream) {
-  NVTE_API_CALL(nvte_device_cutlass_grouped_gemm_wgrad);
+  NVTE_API_CALL(nvte_device_cutlass_grouped_gemm_wgrad_fp16bf16);
   using namespace transformer_engine;
 
   NVTE_CHECK(!transa && transb, "wgrad grouped gemm currently only support NT layout.");
 
   // Process A
   const transformer_engine::Tensor *inputA = convertNVTETensor(A[0]);
-  if (transa) {
-    NVTE_CHECK(inputA->has_data(), "Input A is missing row-wise usage");
-  } else {
-    NVTE_CHECK(inputA->has_columnwise_data(), "Input A is missing column-wise usage");
-  }
-  void *raw_inputA_ptr = transa ? inputA->data.dptr : inputA->columnwise_data.dptr;
-  void *raw_inputA_SF_ptr = transa ? inputA->scale_inv.dptr : inputA->columnwise_scale_inv.dptr;
-  void *raw_inputA_amax_ptr = transa ? inputA->amax.dptr : inputA->columnwise_amax.dptr;
+  void *raw_inputA_ptr = inputA->data.dptr;
 
   // Process B
   const transformer_engine::Tensor *inputB = convertNVTETensor(B[0]);
-  if (transb) {
-    NVTE_CHECK(inputB->has_columnwise_data(), "Input B is missing column-wise usage");
-  } else {
-    NVTE_CHECK(inputB->has_data(), "Input B is missing row-wise usage");
-  }
-  void *raw_inputB_ptr = transb ? inputB->columnwise_data.dptr : inputB->data.dptr;
-  void *raw_inputB_SF_ptr = transb ? inputB->columnwise_scale_inv.dptr : inputB->scale_inv.dptr;
-  void *raw_inputB_amax_ptr = transb ? inputB->columnwise_amax.dptr : inputB->amax.dptr;
+  void *raw_inputB_ptr = inputB->data.dptr;
 
   // Get GEMM shape
   const int gemm_m = transa ? inputA->flat_first_dim() : inputA->flat_last_dim();
@@ -957,11 +744,11 @@ void nvte_device_cutlass_grouped_gemm_wgrad(
 
   // Dispatch
   using transformer_engine::DType;
-  const DType a_dtype = transa ? inputA->data.dtype : inputA->columnwise_data.dtype;
-  const DType b_dtype = transb ? inputB->columnwise_data.dtype : inputB->data.dtype;
+  const DType a_dtype = inputA->data.dtype;
+  const DType b_dtype = inputB->data.dtype;
   NVTE_CHECK(a_dtype == b_dtype, transformer_engine::concat_strings(
                                      "Input A/B dtypes mismatch for wgrad. A=",
-                                     dtype_to_cstr(b_dtype), ", B=", dtype_to_cstr(b_dtype)));
+                                     dtype_to_cstr(a_dtype), ", B=", dtype_to_cstr(b_dtype)));
 
   auto workspace_ptr = convertNVTETensor(workspace[0])->data.dptr;
 
@@ -970,28 +757,19 @@ void nvte_device_cutlass_grouped_gemm_wgrad(
   auto dispatch_layout = [&](auto ab_dtype, auto out_dtype) {
     // dispatch based on output layout
     using ABType = decltype(ab_dtype);
-    constexpr bool IsNVFP4_AB = cute::is_same_v<ABType, cutlass::float_e2m1_t>;
-    using ABSFType = conditional_t<IsNVFP4_AB, cutlass::float_ue4m3_t, cutlass::float_ue8m0_t>;
     using OutType = decltype(out_dtype);
 
     ABType *inputA_ptr = reinterpret_cast<ABType *>(raw_inputA_ptr);
-    ABSFType *inputA_SF_ptr = reinterpret_cast<ABSFType *>(raw_inputA_SF_ptr);
     ABType *inputB_ptr = reinterpret_cast<ABType *>(raw_inputB_ptr);
-    ABSFType *inputB_SF_ptr = reinterpret_cast<ABSFType *>(raw_inputB_SF_ptr);
-
-    const float *inputA_amax_ptr =
-        IsNVFP4_AB ? reinterpret_cast<const float *>(raw_inputA_amax_ptr) : nullptr;
-    const float *inputB_amax_ptr =
-        IsNVFP4_AB ? reinterpret_cast<const float *>(raw_inputB_amax_ptr) : nullptr;
 
     if (transD) {
-      generic_moe_gemm_wgrad_kernelLauncher<ABType, ABSFType, OutType, true>(
-          inputA_ptr, inputA_SF_ptr, inputA_amax_ptr, inputB_ptr, inputB_SF_ptr, inputB_amax_ptr, outputD_ptr_list, gemm_m, gemm_n,
+      generic_moe_gemm_wgrad_kernelLauncher_fp16bf16<ABType, OutType, true>(
+          inputA_ptr, inputB_ptr, outputD_ptr_list, gemm_m, gemm_n,
           m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSize,
           workspace_ptr, stream);
     } else {
-      generic_moe_gemm_wgrad_kernelLauncher<ABType, ABSFType, OutType, false>(
-          inputA_ptr, inputA_SF_ptr, inputA_amax_ptr, inputB_ptr, inputB_SF_ptr, inputB_amax_ptr, outputD_ptr_list, gemm_m, gemm_n,
+      generic_moe_gemm_wgrad_kernelLauncher_fp16bf16<ABType, OutType, false>(
+          inputA_ptr, inputB_ptr, outputD_ptr_list, gemm_m, gemm_n,
           m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSize,
           workspace_ptr, stream);
     }
@@ -1015,17 +793,14 @@ void nvte_device_cutlass_grouped_gemm_wgrad(
   auto dispatch = [&]() {
     // dispatch based on A/B dtype and D type
     switch (a_dtype) {
-      case DType::kFloat8E4M3:
-        dispatch_output_dtype(cutlass::float_e4m3_t{});
+      case DType::kFloat16:
+        dispatch_output_dtype(cutlass::half_t{});
         break;
-      case DType::kFloat8E5M2:
-        dispatch_output_dtype(cutlass::float_e5m2_t{});
-        break;
-      case DType::kFloat4E2M1:
-        dispatch_output_dtype(cutlass::float_e2m1_t{});
+      case DType::kBFloat16:
+        dispatch_output_dtype(cutlass::bfloat16_t{});
         break;
       default:
-        throw std::runtime_error("Unsupported input dtype. A/B must be FP8 e4m3, e5m2 or FP4 e2m1.");
+        throw std::runtime_error("Unsupported input dtype. A/B must be FP16 or BF16.");
     }
   };
 

@@ -168,7 +168,8 @@ list(APPEND transformer_engine_cuda_sources
 
 list(APPEND transformer_engine_cuda_arch_specific_sources
      gemm/cutlass_grouped_gemm.cu
-     gemm/cutlass_device_grouped_gemm.cu
+     gemm/cutlass_device_grouped_gemm_fp16bf16.cu
+     gemm/cutlass_device_grouped_gemm_mxfp8nvfp4.cu
      cast/cast.cu
      activation/gelu.cu
      activation/relu.cu
@@ -236,7 +237,8 @@ set_property(
   PROPERTY
   COMPILE_OPTIONS "--generate-code=arch=compute_90a,code=sm_90a;-g0")
 set_property(
-  SOURCE gemm/cutlass_device_grouped_gemm.cu
+  SOURCE gemm/cutlass_device_grouped_gemm_fp16bf16.cu
+  SOURCE gemm/cutlass_device_grouped_gemm_mxfp8nvfp4.cu
   APPEND
   PROPERTY
   COMPILE_OPTIONS "--generate-code=arch=compute_100a,code=sm_100a;-g0")

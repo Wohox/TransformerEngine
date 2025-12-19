@@ -157,21 +157,24 @@ class _GroupedLinear(torch.autograd.Function):
             else:
                 inputmats = torch.split(cast_if_needed(inp_view, activation_dtype), m_splits.tolist())
         else:
-            assert fp8 and FP8GlobalStateManager.get_fp8_recipe().mxfp8(), "Only MXFP8 is supported when m_splits is on device"
+            assert not fp8 or (fp8 and FP8GlobalStateManager.get_fp8_recipe().mxfp8()), "Only BF16, FP16, MXFP8 is supported when m_splits is on device"
             # assert fp8 and (FP8GlobalStateManager.get_fp8_recipe().mxfp8() or FP8GlobalStateManager.get_fp8_recipe().nvfp4()), "Only MXFP8 or NVFP4 is supported when m_splits is on device"
             # Cannot split because the m_splits is not available on host.
-            if FP8GlobalStateManager.get_fp8_recipe().mxfp8():
-                inputmats = [input_quantizers[0](inp_view)]
+            if fp8:
+                if FP8GlobalStateManager.get_fp8_recipe().mxfp8():
+                    inputmats = [input_quantizers[0](inp_view)]
+                
+                else:
+                    assert False, "No device initiated quantization for NVFP4"
+                    # print("Fprop Before split_quantize:",  inp_view, "shape:", inp_view.shape)
+                    inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], input_quantizers[:1])
+                    inputmats_tmp = tex.split_quantize(inp_view, m_splits.tolist(), input_quantizers)
+                    inputmats[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in inputmats_tmp])
+                    inputmats[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in inputmats_tmp])
+                    # print("+++Quantize inputmats as a whole:",  inputmats[0].get_metadata_debug())
+                    # print("+++Quantize and split inputmats:",  [m.get_metadata_debug() for m in inputmats_tmp])
             else:
-                assert False, "No device initiated quantization for NVFP4"
-                # print("Fprop Before split_quantize:",  inp_view, "shape:", inp_view.shape)
-                inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], input_quantizers[:1])
-                inputmats_tmp = tex.split_quantize(inp_view, m_splits.tolist(), input_quantizers)
-                inputmats[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in inputmats_tmp])
-                inputmats[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in inputmats_tmp])
-                # print("+++Quantize inputmats as a whole:",  inputmats[0].get_metadata_debug())
-                # print("+++Quantize and split inputmats:",  [m.get_metadata_debug() for m in inputmats_tmp])
-
+                inputmats = [cast_if_needed(inp_view, activation_dtype)]
 
         if cpu_offloading:
             start_offload(*inputmats)
@@ -424,10 +427,13 @@ class _GroupedLinear(torch.autograd.Function):
             else:
                 # Only split grad output. Grad bias is fused with
                 # wgrad GEMM.
-                grad_output = torch.split(
-                    cast_if_needed(grad_output_view, ctx.activation_dtype),
-                    ctx.m_splits.tolist(),
-                )
+                if not ctx.m_splits_on_device:
+                    grad_output = torch.split(
+                        cast_if_needed(grad_output_view, ctx.activation_dtype),
+                        ctx.m_splits.tolist(),
+                    )
+                else:
+                    grad_output = [cast_if_needed(grad_output_view, ctx.activation_dtype)]
 
             if ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
@@ -523,19 +529,22 @@ class _GroupedLinear(torch.autograd.Function):
                                 cast_if_needed(inp_view, ctx.activation_dtype), ctx.m_splits.tolist()
                             )
                     else:
-                        assert ctx.fp8 and (ctx.fp8_recipe.mxfp8() or ctx.fp8_recipe.nvfp4()), \
-                            "Only MXFP8 or NVFP4 is supported when m_splits is on device"
+                        assert (ctx.fp8 and (ctx.fp8_recipe.mxfp8() or ctx.fp8_recipe.nvfp4())) or not ctx.fp8, \
+                            "Only FP16, BF16, MXFP8 or NVFP4 is supported when m_splits is on device"
                         # Cannot split because the m_splits is not available on host.
-                        if ctx.fp8_recipe.mxfp8():
-                            inputmats = [ctx.input_quantizers[0](inp_view)]
+                        if ctx.fp8:
+                            if ctx.fp8_recipe.mxfp8():
+                                inputmats = [ctx.input_quantizers[0](inp_view)]
+                            else:
+                                assert False, "No device initiated quantization for NVFP4"
+                                # print("Wgrad Before split_quantize:",  inp_view, "shape:", inp_view.shape)
+                                inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], ctx.input_quantizers[:1])
+                                inputmats_tmp = tex.split_quantize(inp_view, ctx.m_splits.tolist(), ctx.input_quantizers)
+                                inputmats[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in inputmats_tmp])
+                                inputmats[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in inputmats_tmp])
+                                # print("After assigning _amax_rowwise and _amax_columnwise to inputmats[0]:",  inputmats[0].get_metadata_debug())
                         else:
-                            assert False, "No device initiated quantization for NVFP4"
-                            # print("Wgrad Before split_quantize:",  inp_view, "shape:", inp_view.shape)
-                            inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], ctx.input_quantizers[:1])
-                            inputmats_tmp = tex.split_quantize(inp_view, ctx.m_splits.tolist(), ctx.input_quantizers)
-                            inputmats[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in inputmats_tmp])
-                            inputmats[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in inputmats_tmp])
-                            # print("After assigning _amax_rowwise and _amax_columnwise to inputmats[0]:",  inputmats[0].get_metadata_debug())
+                            inputmats = [cast_if_needed(inp_view, ctx.activation_dtype)]
 
                 grouped_gemm_wgrad = functools.partial(
                     general_grouped_gemm,

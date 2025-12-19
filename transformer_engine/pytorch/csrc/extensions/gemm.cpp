@@ -653,11 +653,29 @@ std::optional<std::vector<at::Tensor>> te_general_device_initiated_grouped_gemm(
       // Utilise torch tensor management to ensure memory is retained until the H2D copy is complete.
       inputA_and_SF_addrs = at::empty(num_gemms * 3, options);
     }
+    bool need_quantize = false;
     int gemm_m;
     auto* inputA_and_SF_addr_ptr = inputA_and_SF_addrs.data_ptr<uint64_t>();
     for (size_t i = 0; i < num_gemms; i++) {
       transformer_engine::Tensor* inputA = convertNVTETensor(te_A_vector[i]);
       gemm_m = transa ? inputA->flat_first_dim() : inputA->flat_last_dim();
+
+      // Whether A is an FP8 / FP4 tensor that requires quantization-related metadata.
+      need_quantize = inputA->data.dtype == transformer_engine::DType::kFloat8E4M3 ||
+                      inputA->data.dtype == transformer_engine::DType::kFloat8E5M2 ||
+                      inputA->data.dtype == transformer_engine::DType::kFloat4E2M1;
+
+      // For non‑FP8/FP4 (FP16/BF16/FP32) inputs we always use row‑wise data.
+      // Column‑wise buffers are only guaranteed to exist for quantized tensors.
+      if (!need_quantize) {
+        NVTE_CHECK(inputA->has_data(), "Input A is missing row-wise usage");
+        inputA_and_SF_addr_ptr[i] = static_cast<uint64_t>(
+            reinterpret_cast<std::uintptr_t>(inputA->data.dptr));
+        // The remaining 2 * num_gemms slots (scale_inv / amax) are unused for non‑FP8/FP4.
+        continue;
+      }
+
+      // FP8 / FP4 path: choose data buffer based on transa and usage.
       if (transa) {
         NVTE_CHECK(inputA->has_data(), "Input A is missing row-wise usage");
       } else {
@@ -676,7 +694,8 @@ std::optional<std::vector<at::Tensor>> te_general_device_initiated_grouped_gemm(
       // A amax pointer: each input tensor stores its own scalar amax.
       inputA_and_SF_addr_ptr[2 * num_gemms + i] =
           transa ? static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->amax.dptr))
-                 : static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->columnwise_amax.dptr));
+                 : static_cast<uint64_t>(
+                       reinterpret_cast<std::uintptr_t>(inputA->columnwise_amax.dptr));
     }
     // H2D copy
     at::Tensor inputA_and_SF_addrs_cuda =
@@ -694,14 +713,24 @@ std::optional<std::vector<at::Tensor>> te_general_device_initiated_grouped_gemm(
     te_workspace_vector.emplace_back(wsp.data());
     te_workspace_wrappers.emplace_back(std::move(wsp));
 
-    NVTE_SCOPED_GIL_RELEASE({
-      nvte_device_cutlass_grouped_gemm(
+    if (need_quantize) {
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_device_cutlass_grouped_gemm_mxfp8nvfp4(
           reinterpret_cast<const void**>(inputA_and_SF_addrs_cuda.data_ptr()), te_B_vector.data(),
           te_D_vector.data(), reinterpret_cast<int64_t*>(m_splits.data_ptr()), gemm_m,
           te_bias_vector.data(), te_pre_gelu_out_vector.data(), te_A_vector.size(), transa, transb,
           grad, te_workspace_vector.data(), workspaceSize, use_split_accumulator, math_sm_count,
           at::cuda::getCurrentCUDAStream());
-    });
+      });
+    } else {      NVTE_SCOPED_GIL_RELEASE({
+        nvte_device_cutlass_grouped_gemm_fp16bf16(
+            reinterpret_cast<const void**>(inputA_and_SF_addrs_cuda.data_ptr()), te_B_vector.data(),
+            te_D_vector.data(), reinterpret_cast<int64_t*>(m_splits.data_ptr()), gemm_m,
+            te_bias_vector.data(), te_pre_gelu_out_vector.data(), te_A_vector.size(), transa, transb,
+            grad, te_workspace_vector.data(), workspaceSize, use_split_accumulator, math_sm_count,
+            at::cuda::getCurrentCUDAStream());
+      });
+    }
   } else {  // wgrad
     NVTE_CHECK(!transa,
                "Not implemented, Grouped GEMM input A should not be transposed for wgrad when "
@@ -783,15 +812,30 @@ std::optional<std::vector<at::Tensor>> te_general_device_initiated_grouped_gemm(
     te_workspace_vector.emplace_back(wsp.data());
     te_workspace_wrappers.emplace_back(std::move(wsp));
 
-    NVTE_SCOPED_GIL_RELEASE({
-      nvte_device_cutlass_grouped_gemm_wgrad(
-          te_A_vector.data(), te_B_vector.data(),
-          reinterpret_cast<void**>(outputD_addrs_cuda.data_ptr()), D_type,
-          reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
-          te_pre_gelu_out_vector.data(), te_D_vector.size(), transa, transb,
-          te_workspace_vector.data(), workspaceSize, accumulate, accumulate_mask_ptr,
-          use_split_accumulator, math_sm_count, at::cuda::getCurrentCUDAStream());
-    });
+
+    auto inputB_dtype = convertNVTETensor(te_B_vector[0])->data.dtype; // inputA don't have rowwise usage here
+    bool need_quantize = inputB_dtype  == transformer_engine::DType::kFloat8E4M3 || inputB_dtype == transformer_engine::DType::kFloat8E5M2 || inputB_dtype == transformer_engine::DType::kFloat4E2M1;
+    if (need_quantize) {
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_device_cutlass_grouped_gemm_wgrad_mxfp8nvfp4(
+            te_A_vector.data(), te_B_vector.data(),
+            reinterpret_cast<void**>(outputD_addrs_cuda.data_ptr()), D_type,
+            reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
+            te_pre_gelu_out_vector.data(), te_D_vector.size(), transa, transb,
+            te_workspace_vector.data(), workspaceSize, accumulate, accumulate_mask_ptr,
+            use_split_accumulator, math_sm_count, at::cuda::getCurrentCUDAStream());
+      });
+    } else {
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_device_cutlass_grouped_gemm_wgrad_fp16bf16(
+            te_A_vector.data(), te_B_vector.data(),
+            reinterpret_cast<void**>(outputD_addrs_cuda.data_ptr()), D_type,
+            reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
+            te_pre_gelu_out_vector.data(), te_D_vector.size(), transa, transb,
+            te_workspace_vector.data(), workspaceSize, accumulate, accumulate_mask_ptr,
+            use_split_accumulator, math_sm_count, at::cuda::getCurrentCUDAStream());
+      });
+    }
   }
 
   return bias;

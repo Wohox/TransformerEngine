@@ -344,8 +344,6 @@ def general_grouped_gemm(
             sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
         )
     else:
-        assert isinstance(A[0], MXFP8TensorStorage) and isinstance(
-            B[0], MXFP8TensorStorage), "Only MXFP8 A and B are supported when m_splits is on device"
         assert out[0].dtype == torch.bfloat16 or out[0].dtype == torch.float16 or (
             wgrad and out[0].dtype == torch.float32), "Only BF16, FP16 or FP32(only for wgrad accumulation) output is supported when m_splits is on device"
         assert not use_bias, "Bias is not supported when m_splits is on device"
