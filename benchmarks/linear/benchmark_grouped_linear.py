@@ -53,7 +53,7 @@ ncu -f -o ./benchmarks/linear/ncu_b200_numgemm_8_nvfp4_rht_amax \
     --set=full \
     --kernel-name "GroupHadamardAmaxTmaKernel" \
     -s 5 -c 5 \
-    python benchmarks/linear/benchmark_grouped_linear.py --profile --recipe nvfp4 --profile
+    python benchmarks/linear/benchmark_grouped_linear.py --profile --recipe nvfp4
 
 """
 
@@ -238,7 +238,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", action="store_true", help="Enable profiling mode")
     parser.add_argument(
-        "--output_dir",
+        "--output-dir",
         type=str,
         default="benchmark_output/",
         help="output path for report",
