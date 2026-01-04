@@ -107,6 +107,7 @@ class _GroupedLinear(torch.autograd.Function):
 
         # TODO: Support partial accumulate for cublas backend
         if not m_splits_on_device:
+            m_splits_list = m_splits.tolist()
             assert wgrad_accumulation_mask is None, "when use cublas backend, partial accumulate is not supported"
         # Configure quantizers
         if save_original_input and isinstance(input_quantizers[0], Float8Quantizer):
@@ -149,13 +150,13 @@ class _GroupedLinear(torch.autograd.Function):
         inputmats: list
         if not m_splits_on_device:
             if fp8 and not debug:
-                inputmats = tex.split_quantize(inp_view, m_splits.tolist(), input_quantizers)
+                inputmats = tex.split_quantize(inp_view, m_splits_list, input_quantizers)
             elif debug:
                 inputmats = DebugQuantizer.multi_tensor_quantize(
-                    inp_view, input_quantizers, m_splits.tolist(), activation_dtype
+                    inp_view, input_quantizers, m_splits_list, activation_dtype
                 )
             else:
-                inputmats = torch.split(cast_if_needed(inp_view, activation_dtype), m_splits.tolist())
+                inputmats = torch.split(cast_if_needed(inp_view, activation_dtype), m_splits_list)
         else:
             assert not fp8 or (fp8 and FP8GlobalStateManager.get_fp8_recipe().mxfp8()), "Only BF16, FP16, MXFP8 is supported when m_splits is on device"
             # assert fp8 and (FP8GlobalStateManager.get_fp8_recipe().mxfp8() or FP8GlobalStateManager.get_fp8_recipe().nvfp4()), "Only MXFP8 or NVFP4 is supported when m_splits is on device"
@@ -168,7 +169,7 @@ class _GroupedLinear(torch.autograd.Function):
                     assert False, "No device initiated quantization for NVFP4"
                     # print("Fprop Before split_quantize:",  inp_view, "shape:", inp_view.shape)
                     inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], input_quantizers[:1])
-                    inputmats_tmp = tex.split_quantize(inp_view, m_splits.tolist(), input_quantizers)
+                    inputmats_tmp = tex.split_quantize(inp_view, m_splits_list, input_quantizers)
                     inputmats[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in inputmats_tmp])
                     inputmats[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in inputmats_tmp])
                     # print("+++Quantize inputmats as a whole:",  inputmats[0].get_metadata_debug())
@@ -207,7 +208,7 @@ class _GroupedLinear(torch.autograd.Function):
         # Initialize output tensor
         if not m_splits_on_device:
             out = torch.empty(
-                [sum(m_splits), weights_fp8[0].size(0)],
+                [sum(m_splits_list), weights_fp8[0].size(0)],
                 dtype=activation_dtype,
                 device=device,
             )
@@ -353,6 +354,7 @@ class _GroupedLinear(torch.autograd.Function):
                 weights = saved_tensors[N : 2 * N]
                 origin_weights = saved_tensors[2 * N : 3 * N]
                 biases = saved_tensors[3 * N : 4 * N]
+                m_splits_list = ctx.m_splits.tolist()
             else:
                 inputmats = saved_tensors[:1]
                 weights = saved_tensors[1 : 1 + N]
@@ -378,7 +380,7 @@ class _GroupedLinear(torch.autograd.Function):
             if ctx.fp8 and not ctx.debug:
                 if ctx.use_bias:
                     assert not ctx.m_splits_on_device, "bias is not supported when m_splits is on devie"
-                    grad_output_mats = torch.split(grad_output_view, ctx.m_splits.tolist())
+                    grad_output_mats = torch.split(grad_output_view, m_splits_list)
                     recipe = ctx.fp8_recipe
                     if recipe.delayed() or recipe.float8_current_scaling() or recipe.mxfp8():
                         # Fused bias grad + quantize kernel
@@ -393,7 +395,7 @@ class _GroupedLinear(torch.autograd.Function):
                             grad_biases[i] = grad_output_mats[i].sum(dim=0)
                         grad_output = tex.split_quantize(
                             grad_output_view,
-                            ctx.m_splits.tolist(),
+                            m_splits_list,
                             ctx.grad_output_quantizers,
                         )
                 else:
@@ -401,7 +403,7 @@ class _GroupedLinear(torch.autograd.Function):
                         # Multi-tensor quantize
                         grad_output = tex.split_quantize(
                             grad_output_view,
-                            ctx.m_splits.tolist(),
+                            m_splits_list,
                             ctx.grad_output_quantizers,
                         )
                     else:
@@ -411,18 +413,18 @@ class _GroupedLinear(torch.autograd.Function):
                             assert False, "No device initiated quantization for NVFP4"
                             # print("Dgrad Before split_quantize:",  grad_output_view, "shape:", grad_output_view.shape)
                             grad_output = tex.split_quantize(grad_output_view, [grad_output_view.size(0)], ctx.grad_output_quantizers[:1])
-                            grad_output_tmp = tex.split_quantize(grad_output_view, ctx.m_splits.tolist(), ctx.grad_output_quantizers)
+                            grad_output_tmp = tex.split_quantize(grad_output_view, m_splits_list, ctx.grad_output_quantizers)
                             grad_output[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in grad_output_tmp])
                             grad_output[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in grad_output_tmp])
                             # print("+++Quantize grad_output as a whole:",  grad_output[0].get_metadata_debug())
                             # print("+++Quantize and split grad_output:",  [m.get_metadata_debug() for m in grad_output_tmp])
 
             elif ctx.debug:
-                grad_output_mats = torch.split(grad_output_view, ctx.m_splits.tolist())
+                grad_output_mats = torch.split(grad_output_view, m_splits_list)
                 for i in range(ctx.num_gemms):
                     grad_biases[i] = grad_output_mats[i].sum(dim=0)
                 grad_output = DebugQuantizer.multi_tensor_quantize(
-                    grad_output_view, ctx.grad_output_quantizers, ctx.m_splits.tolist(), ctx.activation_dtype
+                    grad_output_view, ctx.grad_output_quantizers, m_splits_list, ctx.activation_dtype
                 )
             else:
                 # Only split grad output. Grad bias is fused with
@@ -430,7 +432,7 @@ class _GroupedLinear(torch.autograd.Function):
                 if not ctx.m_splits_on_device:
                     grad_output = torch.split(
                         cast_if_needed(grad_output_view, ctx.activation_dtype),
-                        ctx.m_splits.tolist(),
+                        m_splits_list,
                     )
                 else:
                     grad_output = [cast_if_needed(grad_output_view, ctx.activation_dtype)]
@@ -452,7 +454,7 @@ class _GroupedLinear(torch.autograd.Function):
                         )
                 if not ctx.m_splits_on_device:
                     dgrad = torch.empty(
-                        (sum(ctx.m_splits), ctx.weights_shape_1),
+                        (sum(m_splits_list), ctx.weights_shape_1),
                         dtype=ctx.activation_dtype,
                         device=ctx.device,
                     )
@@ -519,14 +521,14 @@ class _GroupedLinear(torch.autograd.Function):
                     inputmats: list
                     if not ctx.m_splits_on_device:
                         if ctx.fp8 and not ctx.debug:
-                            inputmats = tex.split_quantize(inp_view, ctx.m_splits.tolist(), ctx.input_quantizers)
+                            inputmats = tex.split_quantize(inp_view, m_splits_list, ctx.input_quantizers)
                         elif ctx.debug:
                             inputmats = DebugQuantizer.multi_tensor_quantize(
-                                inp_view, ctx.input_quantizers, ctx.m_splits.tolist(), ctx.activation_dtype
+                                inp_view, ctx.input_quantizers, m_splits_list, ctx.activation_dtype
                             )
                         else:
                             inputmats = torch.split(
-                                cast_if_needed(inp_view, ctx.activation_dtype), ctx.m_splits.tolist()
+                                cast_if_needed(inp_view, ctx.activation_dtype), m_splits_list
                             )
                     else:
                         assert (ctx.fp8 and (ctx.fp8_recipe.mxfp8() or ctx.fp8_recipe.nvfp4())) or not ctx.fp8, \
@@ -539,7 +541,7 @@ class _GroupedLinear(torch.autograd.Function):
                                 assert False, "No device initiated quantization for NVFP4"
                                 # print("Wgrad Before split_quantize:",  inp_view, "shape:", inp_view.shape)
                                 inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], ctx.input_quantizers[:1])
-                                inputmats_tmp = tex.split_quantize(inp_view, ctx.m_splits.tolist(), ctx.input_quantizers)
+                                inputmats_tmp = tex.split_quantize(inp_view, m_splits_list, ctx.input_quantizers)
                                 inputmats[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in inputmats_tmp])
                                 inputmats[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in inputmats_tmp])
                                 # print("After assigning _amax_rowwise and _amax_columnwise to inputmats[0]:",  inputmats[0].get_metadata_debug())
