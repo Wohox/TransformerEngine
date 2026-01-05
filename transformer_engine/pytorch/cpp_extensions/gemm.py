@@ -241,7 +241,7 @@ def general_grouped_gemm(
     out_dtype: torch.dtype,
     layout: str = "TN",
     m_splits: Optional[torch.Tensor] = None,
-    m_splits_on_device: bool = False,
+    is_device_initialized: bool = False,
     gelu: bool = False,
     grad=False,
     wgrad=False,
@@ -270,7 +270,7 @@ def general_grouped_gemm(
     out_dtype = TE_DType[out[0].dtype] if D_dtype is None else D_dtype
 
     sm_count = get_sm_count()
-    if not m_splits_on_device:
+    if not is_device_initialized:
         workspaces = get_cublas_workspace(get_tensor_device(A[0]), False, True)
     else:
         workspaces = get_cutlass_device_grouped_gemm_workspace()
@@ -323,7 +323,7 @@ def general_grouped_gemm(
             for o in out
         ]  # this should differ with respect to single output
 
-    if not m_splits_on_device:
+    if not is_device_initialized:
         bias = tex.te_general_grouped_gemm(
             A,
             transa,

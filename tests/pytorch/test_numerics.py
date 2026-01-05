@@ -1825,7 +1825,8 @@ def _test_grouped_linear_accuracy(
     fp8,
     fuse_wgrad_accumulation,
     delay_wgrad_compute=False,
-    m_splits_on_device=False,
+    is_device_initialized=False,
+    m_splits_on_pinned_memory=False,
 ):
     reset_rng_states()
     if fp8:
@@ -1853,11 +1854,13 @@ def _test_grouped_linear_accuracy(
         m_splits = torch.tensor([config.max_seqlen_q])
 
     with autocast(enabled=fp8, recipe=recipe):
-        if m_splits_on_device:
-            m_splits = m_splits.to("cuda")
         if isinstance(block, GroupedLinear):
             m_splits = m_splits * bs
-            out = block(inp_hidden_states, m_splits)
+            if m_splits_on_pinned_memory:
+                m_splits = m_splits.pin_memory()
+            elif is_device_initialized:
+                m_splits = m_splits.to("cuda")
+            out = block(inp_hidden_states, m_splits, is_device_initialized=is_device_initialized)
         else:
             out = torch.cat(
                 [
@@ -1908,7 +1911,8 @@ def test_grouped_linear_accuracy(
     delay_wgrad_compute,
     parallel_mode=None,
     use_cutlass=False,
-    m_splits_on_device=False,
+    is_device_initialized=False,
+    m_splits_on_pinned_memory=False,
     num_unfuse_wgrad_accumulation=0,
 ):
     fp8 = recipe is not None
@@ -1926,8 +1930,8 @@ def test_grouped_linear_accuracy(
             pytest.skip(
                 f"Input dtype {dtype} not supported for NVFP4 Recipe {recipe.__class__.__name__}"
             )
-    if num_unfuse_wgrad_accumulation > 0 and not m_splits_on_device:
-        pytest.skip("Partial accumulate is not supported when m_splits_on_device is False")
+    if num_unfuse_wgrad_accumulation > 0 and not is_device_initialized:
+        pytest.skip("Partial accumulate is not supported when is_device_initialized is False")
     wgrad_accumulation_mask = None
     if fuse_wgrad_accumulation and num_unfuse_wgrad_accumulation > 0 and num_unfuse_wgrad_accumulation < num_gemms:
         wgrad_accumulation_mask = torch.ones(num_gemms, dtype=torch.bool)
@@ -1987,7 +1991,8 @@ def test_grouped_linear_accuracy(
         fp8,
         fuse_wgrad_accumulation,
         delay_wgrad_compute,
-        m_splits_on_device
+        is_device_initialized,
+        m_splits_on_pinned_memory
     )
 
     outputs = _test_grouped_linear_accuracy(
@@ -2000,7 +2005,8 @@ def test_grouped_linear_accuracy(
         fp8,
         fuse_wgrad_accumulation,
         delay_wgrad_compute,
-        m_splits_on_device
+        is_device_initialized,
+        m_splits_on_pinned_memory
     )
    
 
@@ -2027,6 +2033,7 @@ def test_grouped_linear_accuracy(
 @pytest.mark.parametrize("fuse_wgrad_accumulation", all_boolean)
 @pytest.mark.parametrize("delay_wgrad_compute", all_boolean)
 @pytest.mark.parametrize("num_unfuse_wgrad_accumulation", [0, 1, 2])
+@pytest.mark.parametrize("m_splits_on_pinned_memory", all_boolean)
 def test_grouped_linear_accuracy_cutlass_device(
     dtype,
     num_gemms,
@@ -2035,8 +2042,9 @@ def test_grouped_linear_accuracy_cutlass_device(
     recipe,
     fp8_model_params,
     fuse_wgrad_accumulation,
-    num_unfuse_wgrad_accumulation,
     delay_wgrad_compute,
+    num_unfuse_wgrad_accumulation,
+    m_splits_on_pinned_memory,
 ):
     test_grouped_linear_accuracy(
         dtype,
@@ -2048,7 +2056,8 @@ def test_grouped_linear_accuracy_cutlass_device(
         fuse_wgrad_accumulation,
         False,
         delay_wgrad_compute,
-        m_splits_on_device=True,
+        is_device_initialized=True,
+        m_splits_on_pinned_memory=m_splits_on_pinned_memory,
         num_unfuse_wgrad_accumulation=num_unfuse_wgrad_accumulation,
     )
 
@@ -2096,7 +2105,7 @@ def test_grouped_linear_accuracy_cutlass(
 @pytest.mark.parametrize("fuse_wgrad_accumulation", [True])
 @pytest.mark.parametrize("bias", [False])
 @pytest.mark.parametrize("delay_wgrad_compute", [True])
-@pytest.mark.parametrize("m_splits_on_device", all_boolean)
+@pytest.mark.parametrize("is_device_initialized", all_boolean)
 def test_grouped_linear_accuracy_save_original_input(
     dtype,
     num_gemms,
@@ -2107,7 +2116,7 @@ def test_grouped_linear_accuracy_save_original_input(
     fuse_wgrad_accumulation,
     bias,
     delay_wgrad_compute,
-    m_splits_on_device,
+    is_device_initialized,
     parallel_mode=None,
 ):
     fp8 = recipe is not None
@@ -2117,8 +2126,8 @@ def test_grouped_linear_accuracy_save_original_input(
         pytest.skip("DelayedScaling recipe is not supported with save_original_input")
     if NVTE_TEST_NVINSPECT_ENABLED and delay_wgrad_compute:
         pytest.skip("Delayed wgrad compute is not supported in debug mode.")
-    if m_splits_on_device and (not (fp8 and recipe.mxfp8()) or dtype not in [torch.bfloat16]):
-        pytest.skip("m_splits_on_device is only supported with MXFP8 recipe and bfloat16 dtype")
+    if is_device_initialized and (not (fp8 and recipe.mxfp8()) or dtype not in [torch.bfloat16]):
+        pytest.skip("is_device_initialized is only supported with MXFP8 recipe and bfloat16 dtype")
 
     config = model_configs[model]
     if config.max_seqlen_q % 16 != 0 and fp8:
@@ -2179,7 +2188,7 @@ def test_grouped_linear_accuracy_save_original_input(
         fp8,
         fuse_wgrad_accumulation,
         delay_wgrad_compute,
-        m_splits_on_device,
+        is_device_initialized,
     )
     outputs = _test_grouped_linear_accuracy(
         grouped_linear,
@@ -2191,7 +2200,7 @@ def test_grouped_linear_accuracy_save_original_input(
         fp8,
         fuse_wgrad_accumulation,
         delay_wgrad_compute,
-        m_splits_on_device,
+        is_device_initialized,
     )
 
     # Shoule be bit-wise match
@@ -2215,7 +2224,7 @@ def test_grouped_linear_accuracy_single_gemm(recipe):
     )
 
 
-def _test_padding_grouped_linear_accuracy(block, num_gemms, bs, dtype, config, recipe, fp8=False, m_splits_on_device=False):
+def _test_padding_grouped_linear_accuracy(block, num_gemms, bs, dtype, config, recipe, fp8=False, is_device_initialized=False):
 
     def _pad_tensor_for_fp8(hidden_states, tokens_per_expert):
         align_size = get_align_size_for_quantization(recipe)
@@ -2292,7 +2301,7 @@ def _test_padding_grouped_linear_accuracy(block, num_gemms, bs, dtype, config, r
                 padded_inp_hidden_states, padding_m_splits = _pad_tensor_for_fp8(
                     inp_hidden_states, m_splits
                 )
-                padded_inp_hidden_states = block(padded_inp_hidden_states, torch.tensor(padding_m_splits, device="cuda" if m_splits_on_device else "cpu"))
+                padded_inp_hidden_states = block(padded_inp_hidden_states, torch.tensor(padding_m_splits, device="cuda" if is_device_initialized else "cpu"))
                 out = _unpad_tensor_for_fp8(padded_inp_hidden_states, m_splits, padding_m_splits)
             else:
                 out = block(inp_hidden_states, m_splits)
@@ -2315,7 +2324,7 @@ def _test_padding_grouped_linear_accuracy(block, num_gemms, bs, dtype, config, r
 @pytest.mark.parametrize("fp8", [True])
 @pytest.mark.parametrize("recipe", fp8_recipes)
 @pytest.mark.parametrize("fp8_model_params", all_boolean)
-@pytest.mark.parametrize("m_splits_on_device", all_boolean)
+@pytest.mark.parametrize("is_device_initialized", all_boolean)
 def test_padding_grouped_linear_accuracy(
     dtype,
     num_gemms,
@@ -2324,7 +2333,7 @@ def test_padding_grouped_linear_accuracy(
     fp8,
     recipe,
     fp8_model_params,
-    m_splits_on_device,
+    is_device_initialized,
     parallel_mode=None,
 ):
     if fp8_model_params and NVTE_TEST_NVINSPECT_ENABLED:
@@ -2339,8 +2348,8 @@ def test_padding_grouped_linear_accuracy(
             pytest.skip(
                 f"Input dtype {dtype} not supported for NVFP4 Recipe {recipe.__class__.__name__}"
             )
-    if m_splits_on_device and (not recipe.mxfp8() or dtype not in [torch.bfloat16]):
-        pytest.skip("m_splits_on_device is only supported with MXFP8 recipe and bfloat16 dtype")
+    if is_device_initialized and (not recipe.mxfp8() or dtype not in [torch.bfloat16]):
+        pytest.skip("is_device_initialized is only supported with MXFP8 recipe and bfloat16 dtype")
 
     with quantized_model_init(enabled=fp8 and fp8_model_params, recipe=recipe):
         grouped_linear = TorchGroupedLinearWithPadding(
@@ -2376,10 +2385,10 @@ def test_padding_grouped_linear_accuracy(
             )
 
     outputs = _test_padding_grouped_linear_accuracy(
-        grouped_linear, num_gemms, bs, dtype, config, recipe, fp8, m_splits_on_device
+        grouped_linear, num_gemms, bs, dtype, config, recipe, fp8, is_device_initialized
     )
     outputs_ref = _test_padding_grouped_linear_accuracy(
-        ref_grouped_linear, num_gemms, bs, dtype, config, recipe, fp8, m_splits_on_device
+        ref_grouped_linear, num_gemms, bs, dtype, config, recipe, fp8, is_device_initialized
     )
 
     # Shoule be bit-wise match
@@ -2394,7 +2403,7 @@ def test_padding_grouped_linear_accuracy(
 @pytest.mark.parametrize("fp8", [True])
 @pytest.mark.parametrize("recipe", fp8_recipes)
 @pytest.mark.parametrize("fp8_model_params", [False])
-@pytest.mark.parametrize("m_splits_on_device", all_boolean)
+@pytest.mark.parametrize("is_device_initialized", all_boolean)
 def test_padding_grouped_linear_accuracy_save_original_input(
     dtype,
     num_gemms,
@@ -2403,7 +2412,7 @@ def test_padding_grouped_linear_accuracy_save_original_input(
     fp8,
     recipe,
     fp8_model_params,
-    m_splits_on_device,
+    is_device_initialized,
     parallel_mode=None,
 ):
     if fp8_model_params and NVTE_TEST_NVINSPECT_ENABLED:
@@ -2421,8 +2430,8 @@ def test_padding_grouped_linear_accuracy_save_original_input(
                 f"Input dtype {dtype} not supported for NVFP4 Recipe {recipe.__class__.__name__}"
             )
 
-    if m_splits_on_device and (not recipe.mxfp8() or dtype not in [torch.bfloat16]):
-        pytest.skip("m_splits_on_device is only supported with MXFP8 recipe and bfloat16 dtype")
+    if is_device_initialized and (not recipe.mxfp8() or dtype not in [torch.bfloat16]):
+        pytest.skip("is_device_initialized is only supported with MXFP8 recipe and bfloat16 dtype")
 
     with quantized_model_init(enabled=fp8 and fp8_model_params, recipe=recipe):
         grouped_linear = TorchGroupedLinearWithPadding(
@@ -2458,10 +2467,10 @@ def test_padding_grouped_linear_accuracy_save_original_input(
             )
 
     outputs = _test_padding_grouped_linear_accuracy(
-        grouped_linear, num_gemms, bs, dtype, config, recipe, fp8, m_splits_on_device
+        grouped_linear, num_gemms, bs, dtype, config, recipe, fp8, is_device_initialized
     )
     outputs_ref = _test_padding_grouped_linear_accuracy(
-        ref_grouped_linear, num_gemms, bs, dtype, config, recipe, fp8, m_splits_on_device
+        ref_grouped_linear, num_gemms, bs, dtype, config, recipe, fp8, is_device_initialized
     )
 
     # Shoule be bit-wise match
