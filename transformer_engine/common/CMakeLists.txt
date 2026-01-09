@@ -78,9 +78,28 @@ endif()
 # Configure Transformer Engine library
 include_directories(${PROJECT_SOURCE_DIR}/..)
 set(transformer_engine_SOURCES)
-list(APPEND transformer_engine_SOURCES
+set(transformer_engine_cpp_sources)
+set(transformer_engine_cuda_sources)
+set(transformer_engine_cuda_arch_specific_sources)
+
+list(APPEND transformer_engine_cpp_sources
      cudnn_utils.cpp
      transformer_engine.cpp
+     fused_attn/fused_attn.cpp
+     gemm/config.cpp
+     normalization/common.cpp
+     normalization/layernorm/ln_api.cpp
+     normalization/rmsnorm/rmsnorm_api.cpp
+     util/cuda_driver.cpp
+     util/cuda_nvml.cpp
+     util/cuda_runtime.cpp
+     util/multi_stream.cpp
+     util/rtc.cpp
+     comm_gemm_overlap/userbuffers/ipcsocket.cc
+     comm_gemm_overlap/userbuffers/userbuffers-host.cpp
+     comm_gemm_overlap/comm_gemm_overlap.cpp)
+
+list(APPEND transformer_engine_cuda_sources
      common.cu
      multi_tensor/adam.cu
      multi_tensor/compute_scale.cu
@@ -92,40 +111,23 @@ list(APPEND transformer_engine_SOURCES
      transpose/cast_transpose_fusion.cu
      transpose/transpose_fusion.cu
      transpose/multi_cast_transpose.cu
-     transpose/quantize_transpose_square_blockwise.cu
      transpose/quantize_transpose_vector_blockwise.cu
      transpose/swap_first_dims.cu
-     transpose/quantize_transpose_vector_blockwise_fp4.cu
-     activation/gelu.cu
      dropout/dropout.cu
      fused_attn/flash_attn.cu
      fused_attn/context_parallel.cu
      fused_attn/kv_cache.cu
      fused_attn/fused_attn_f16_max512_seqlen.cu
      fused_attn/fused_attn_f16_arbitrary_seqlen.cu
-     activation/relu.cu
-     activation/swiglu.cu
      fused_attn/fused_attn_fp8.cu
-     fused_attn/fused_attn.cpp
      fused_attn/utils.cu
-     gemm/config.cpp
      gemm/cublaslt_gemm.cu
-     gemm/cutlass_grouped_gemm.cu
-     normalization/common.cpp
-     normalization/layernorm/ln_api.cpp
      normalization/layernorm/ln_bwd_semi_cuda_kernel.cu
      normalization/layernorm/ln_fwd_cuda_kernel.cu
-     normalization/rmsnorm/rmsnorm_api.cpp
      normalization/rmsnorm/rmsnorm_bwd_semi_cuda_kernel.cu
      normalization/rmsnorm/rmsnorm_fwd_cuda_kernel.cu
      permutation/permutation.cu
-     util/cast.cu
      util/padding.cu
-     util/cuda_driver.cpp
-     util/cuda_nvml.cpp
-     util/cuda_runtime.cpp
-     util/multi_stream.cpp
-     util/rtc.cpp
      swizzle/swizzle.cu
      swizzle/swizzle_block_scaling.cu
      fused_softmax/scaled_masked_softmax.cu
@@ -139,12 +141,59 @@ list(APPEND transformer_engine_SOURCES
      recipe/delayed_scaling.cu
      recipe/fp8_block_scaling.cu
      recipe/nvfp4.cu
+     comm_gemm_overlap/userbuffers/userbuffers.cu)
+
+list(APPEND transformer_engine_cuda_arch_specific_sources
+     gemm/cutlass_grouped_gemm.cu
+     gemm/cutlass_device_grouped_gemm.cu
+     util/cast.cu
+     activation/gelu.cu
+     activation/relu.cu
+     activation/swiglu.cu
+     transpose/quantize_transpose_square_blockwise.cu
+     transpose/quantize_transpose_vector_blockwise_fp4.cu
      hadamard_transform/hadamard_transform.cu
-     hadamard_transform/hadamard_transform_cast_fusion.cu
-     comm_gemm_overlap/userbuffers/ipcsocket.cc
-     comm_gemm_overlap/userbuffers/userbuffers-host.cpp
-     comm_gemm_overlap/userbuffers/userbuffers.cu
-     comm_gemm_overlap/comm_gemm_overlap.cpp)
+     hadamard_transform/hadamard_transform_cast_fusion.cu)
+
+# Compiling the files with the worst compilation time first to hopefully overlap
+# better with the faster-compiling cpp files
+list(APPEND transformer_engine_SOURCES ${transformer_engine_cuda_arch_specific_sources}
+                                       ${transformer_engine_cuda_sources}
+                                       ${transformer_engine_cpp_sources})
+
+# Set compile options for CUDA sources with generic architectures
+foreach(cuda_source IN LISTS transformer_engine_cuda_sources)
+  set(arch_compile_options)
+  foreach(arch IN LISTS NVTE_GENERIC_ARCHS)
+    list(APPEND arch_compile_options "--generate-code=arch=compute_${arch},code=sm_${arch}")
+  endforeach()
+
+  if(arch_compile_options)
+    set_property(
+      SOURCE ${cuda_source}
+      APPEND
+      PROPERTY
+      COMPILE_OPTIONS ${arch_compile_options}
+    )
+  endif()
+endforeach()
+
+# Set compile options for CUDA sources with specific architectures
+foreach(cuda_source IN LISTS transformer_engine_cuda_arch_specific_sources)
+  set(arch_compile_options)
+  foreach(arch IN LISTS NVTE_SPECIFIC_ARCHS)
+    list(APPEND arch_compile_options "--generate-code=arch=compute_${arch},code=sm_${arch}")
+  endforeach()
+
+  if(arch_compile_options)
+    set_property(
+      SOURCE ${cuda_source}
+      APPEND
+      PROPERTY
+      COMPILE_OPTIONS ${arch_compile_options}
+    )
+  endif()
+endforeach()
 
 if (NVTE_WITH_CUBLASMP)
 list(APPEND transformer_engine_SOURCES
@@ -161,6 +210,11 @@ set_property(
   APPEND
   PROPERTY
   COMPILE_OPTIONS "--generate-code=arch=compute_90a,code=sm_90a;-g0")
+set_property(
+  SOURCE gemm/cutlass_device_grouped_gemm.cu
+  APPEND
+  PROPERTY
+  COMPILE_OPTIONS "--generate-code=arch=compute_100a,code=sm_100a;-g0")
 
 # Configure dependencies
 target_link_libraries(transformer_engine PUBLIC
